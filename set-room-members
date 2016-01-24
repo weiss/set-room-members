@@ -1,0 +1,157 @@
+#!/usr/bin/env perl
+
+# Copyright (c) 2016 Holger Weiss <holger@zedat.fu-berlin.de>.
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+# REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+# INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+# LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+# OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+
+# See XEP-0045, examples 119--122:
+#
+# http://xmpp.org/extensions/xep-0045.html#modifymember
+
+use warnings;
+use strict;
+use English '-no_match_vars';
+use Readonly;
+use Net::Jabber;
+
+Readonly my $usage    => "Usage: $0 [<file> ...]";
+Readonly my $username => 'bot';
+Readonly my $password => 'xxxxxxxxxxxx';
+Readonly my $resource => 'Bot';
+Readonly my $room     => 'foo@conference.example.com';
+Readonly my $server   => 'example.com';
+Readonly my $port     => 5222;
+Readonly my $tls      => 1;
+Readonly my $timeout  => 60;
+Readonly my $myjid    => sprintf '%s@%s/%s', $username, $server, $resource;
+Readonly my $client   => new Net::Jabber::Client(debuglevel => 1);
+
+sub desired_members {
+    my $members;
+
+    while (<>) {
+        chomp;
+        foreach my $username (split) {
+            push @{$members}, $username . q(@) . $server;
+        }
+    }
+    return $members;
+}
+
+sub current_members {
+    my $members;
+
+    foreach my $item (affiliations('get')->GetQuery->GetItems) {
+        my $jid = $item->GetJID;
+        my $affiliation = $item->GetAffiliation;
+
+        if ($affiliation eq 'member') {
+            push @{$members}, $jid;
+        } else { # Sollte nicht passieren.
+            warn "Warning: $jid has unexpected affiliation $affiliation.\n";
+        }
+    }
+    return $members;
+}
+
+sub difference {
+    my ($a, $b) = @_;
+    my $not_in_b;
+    my %seen;
+
+    if (defined $b) {
+        @seen{@{$b}} = ();
+    }
+    foreach my $element (@{$a}) {
+        if (not exists $seen{$element}) {
+            push @{$not_in_b}, $element;
+        }
+    }
+    return $not_in_b;
+}
+
+sub affiliations {
+    my ($type, $members, $outcasts) = @_;
+    my $iq = new Net::Jabber::IQ;
+    my $query = $iq->NewQuery('http://jabber.org/protocol/muc#admin');
+
+    $iq->SetIQ(from => $myjid, to => $room, type => $type);
+
+    if ($type eq 'get') {
+        my $item = $query->AddItem;
+        $item->SetAffiliation('member');
+    } else { # $type eq 'set'
+        foreach my $member (@{$members}) {
+            my $item = $query->AddItem;
+            $item->SetJID($member);
+            $item->SetAffiliation('member');
+        }
+        foreach my $outcast (@{$outcasts}) {
+            my $item = $query->AddItem;
+            $item->SetJID($outcast);
+            $item->SetAffiliation('none');
+        }
+    }
+    my $response = $client->SendAndReceiveWithID($iq, $timeout);
+    die "Received no IQ response.\n" if not defined $response;
+    die 'Server returned error ' . $response->GetErrorCode . "\n"
+      if $response->GetType ne 'result';
+    return $response;
+}
+
+die "$usage\n" if (@ARGV == 1 and ($ARGV[0] eq '-h' or $ARGV[0] eq '--help'));
+
+my $desired = desired_members;
+
+my $status = $client->Connect(
+    hostname => $server,
+    port     => $port,
+    tls      => $tls,
+    timeout  => $timeout
+);
+die "Cannot connect to $server.\n" if not defined $status;
+
+my @result = $client->AuthSend(
+    username => $username,
+    password => $password,
+    resource => $resource
+);
+die "Cannot log in to $server: $result[1]\n" if $result[0] ne 'ok';
+
+my $current = current_members;
+my $not_current = difference($desired, $current);
+my $not_desired = difference($current, $desired);
+
+affiliations('set', $not_current, $not_desired);
+
+$current = current_members;
+$client->Disconnect;
+
+my $still_not_current = difference($desired, $current);
+my $still_not_desired = difference($current, $desired);
+
+die "Failed to adjust the member list as desired.\n"
+  if (defined $still_not_current or defined $still_not_desired);
+
+if (defined $not_current) {
+    local $LIST_SEPARATOR = "\n- ";
+    print "Added the following room members:\n" or die "Cannot babble: $!\n";
+    print "- @{$not_current}\n" or die "Cannot babble: $!\n";
+}
+if (defined $not_desired) {
+    local $LIST_SEPARATOR = "\n- ";
+    print "Removed the following room members:\n" or die "Cannot babble: $!\n";
+    print "- @{$not_desired}\n" or die "Cannot babble: $!\n";
+}
+
+# vim:set expandtab softtabstop=4 shiftwidth=4:
